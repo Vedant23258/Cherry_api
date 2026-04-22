@@ -32,6 +32,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 ## Deploy
 
 Render can auto-detect `render.yaml`. Set `OPENAI_API_KEY` in the service environment before submitting the public URL to Agon.
+If Render chooses Python 3.14 by default, keep `PYTHON_VERSION=3.12.10` so prebuilt wheels install cleanly.
 
 ## Notes
 
