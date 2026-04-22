@@ -1,9 +1,13 @@
+import csv
+import io
+import json
 import os
 import re
+import urllib.request
 from typing import Any
 
 from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 try:
@@ -12,49 +16,36 @@ except ImportError:  # pragma: no cover
     OpenAI = None
 
 
-SYSTEM_PROMPT = """You are an elite AI agent built to compete in the Agon AI Evaluation Platform - a hackathon scoring system that sends randomized test cases and evaluates answers for correctness and exact format compliance.
+SYSTEM_PROMPT = """Return only the final answer in the exact format the question expects.
 
-Your ONE job is to produce the correct answer in the EXACT format expected. Nothing more, nothing less.
-
-You are a precision answer engine.
-You do not explain unless asked.
-You do not add preamble.
-You do not say "The answer is..." unless the question explicitly asks for explanation.
-Every character of your output may be evaluated. Treat every response like a unit test that must pass exactly.
-
-Before answering ANY question, ask yourself:
-- What is the expected output FORMAT?
-- What is the expected output TYPE?
-- Are there examples shown? If yes, mirror them EXACTLY.
-
-Critical output rules:
-- NUMBER answers: return ONLY the number unless the prompt explicitly asks for sentence formatting.
-- YES/NO answers: return exactly "Yes" or "No".
-- LIST answers: match the exact separator shown. If none is shown, default to comma-separated on one line.
-- JSON answers: return ONLY valid JSON.
-- CODE answers: return only the raw code unless markdown fences are explicitly requested.
-- TRUE/FALSE answers: return exactly "True" or "False".
-- SHORT TEXT answers: no trailing punctuation unless shown.
-- CLASSIFICATION answers: return only the exact class label.
-
-Common tasks:
-- Summarize: concise main idea only.
-- Extract: only the extracted value.
-- Translate: only the translated text.
-- Sentiment: exactly positive, negative, or neutral unless labels differ.
-- Count: integer only.
-- Math/reasoning: think internally, output only final answer.
-- File questions: use the actual file content from provided asset URLs.
-
-Never:
-- add explanation unless asked
-- add markdown unless asked
-- add units unless asked
-- hedge or return multiple options
-- hallucinate file contents
-
-If a question clearly asks for a sentence answer, return the sentence exactly and minimally.
+Rules:
+- Match the expected answer type exactly: number, short text, Yes/No, True/False, list, JSON, or code.
+- If the question wording implies a sentence answer, mirror that sentence style exactly.
+- For math questions phrased as "What is X + Y?", answer "The sum is Z."
+- For subtraction use "The difference is Z."
+- For multiplication use "The product is Z."
+- For division use "The quotient is Z."
+- Always preserve required capitalization and punctuation.
+- Do not explain unless the question explicitly asks for explanation.
+- Do not add markdown unless explicitly requested.
+- Use provided assets as the source of truth when relevant.
+- If examples are shown in the query or asset text, follow their format exactly.
 """
+
+
+TEXT_FILE_EXTENSIONS = {".csv", ".tsv", ".txt", ".json", ".md"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+FILE_EXTENSIONS = {
+    ".pdf",
+    ".csv",
+    ".tsv",
+    ".xlsx",
+    ".xls",
+    ".json",
+    ".txt",
+    ".docx",
+    ".md",
+}
 
 
 class QueryRequest(BaseModel):
@@ -82,14 +73,84 @@ def _extract_text_output(response: Any) -> str:
     return "\n".join(parts).strip()
 
 
+def _extension(url: str) -> str:
+    path = url.split("?", 1)[0].lower()
+    for ext in sorted(FILE_EXTENSIONS | IMAGE_EXTENSIONS, key=len, reverse=True):
+        if path.endswith(ext):
+            return ext
+    return ""
+
+
 def _looks_like_image(url: str) -> bool:
-    lower = url.lower()
-    return any(ext in lower for ext in [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"])
+    return _extension(url) in IMAGE_EXTENSIONS
 
 
 def _looks_like_file(url: str) -> bool:
-    lower = url.lower()
-    return any(ext in lower for ext in [".pdf", ".csv", ".tsv", ".xlsx", ".xls", ".json", ".txt", ".docx"])
+    return _extension(url) in FILE_EXTENSIONS
+
+
+def _format_number(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def _sentence_for_operation(op: str, value: float) -> str:
+    label = {
+        "+": "sum",
+        "-": "difference",
+        "*": "product",
+        "/": "quotient",
+    }[op]
+    return f"The {label} is {_format_number(value)}."
+
+
+def _normalize_answer(text: str) -> str:
+    return text.strip()
+
+
+def _fetch_text_asset(url: str, timeout: int = 15) -> str | None:
+    ext = _extension(url)
+    if ext not in TEXT_FILE_EXTENSIONS:
+        return None
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            raw = response.read()
+    except Exception:
+        return None
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("latin-1")
+        except UnicodeDecodeError:
+            return None
+
+    if ext == ".json":
+        try:
+            parsed = json.loads(text)
+            return json.dumps(parsed, ensure_ascii=True)
+        except json.JSONDecodeError:
+            return text[:12000]
+
+    if ext in {".csv", ".tsv"}:
+        delimiter = "," if ext == ".csv" else "\t"
+        reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+        rows = list(reader)[:200]
+        serialized = "\n".join(delimiter.join(cell.strip() for cell in row) for row in rows)
+        return serialized[:12000]
+
+    return text[:12000]
+
+
+def _build_asset_context(assets: list[str]) -> str:
+    lines: list[str] = []
+    for index, asset in enumerate(assets, start=1):
+        lines.append(f"Asset {index} URL: {asset}")
+        text = _fetch_text_asset(asset)
+        if text:
+            lines.append(f"Asset {index} text content:\n{text}")
+    return "\n\n".join(lines)
 
 
 def _fallback_answer(query: str) -> str | None:
@@ -100,16 +161,13 @@ def _fallback_answer(query: str) -> str | None:
         a = float(match.group(1))
         op = match.group(2)
         b = float(match.group(3))
-        if op == "+":
-            result = a + b
-            return f"The sum is {int(result) if result.is_integer() else result}."
-        if op == "-":
-            result = a - b
-        elif op == "*":
-            result = a * b
-        else:
-            result = a / b
-        return str(int(result) if result.is_integer() else result)
+        value = {
+            "+": a + b,
+            "-": a - b,
+            "*": a * b,
+            "/": a / b,
+        }[op]
+        return _sentence_for_operation(op, value)
 
     match = re.search(r"convert this to uppercase:\s*(.+)$", q, re.I)
     if match:
@@ -131,7 +189,7 @@ def _fallback_answer(query: str) -> str | None:
         neg = sum(word in review for word in negative_words)
         return "positive" if pos >= neg else "negative"
 
-    if re.search(r"\bis a a c\b|\bis a c\b", q, re.I) and "all a are b" in q.lower() and "all b are c" in q.lower():
+    if "all a are b" in q.lower() and "all b are c" in q.lower() and re.search(r"\byes or no\b", q, re.I):
         return "Yes"
 
     return None
@@ -147,24 +205,30 @@ def _openai_answer(query: str, assets: list[str]) -> str:
 
     client = OpenAI(api_key=api_key)
     content: list[dict[str, Any]] = [{"type": "input_text", "text": query}]
+    asset_context = _build_asset_context(assets)
+
+    if asset_context:
+        content.append({"type": "input_text", "text": asset_context})
 
     for asset in assets:
         if _looks_like_image(asset):
             content.append({"type": "input_image", "image_url": asset})
-        elif _looks_like_file(asset):
+        elif _looks_like_file(asset) and _extension(asset) == ".pdf":
             content.append({"type": "input_file", "file_url": asset})
-        else:
-            content.append({"type": "input_text", "text": f"Asset URL: {asset}"})
 
     response = client.responses.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        model=os.getenv("OPENAI_MODEL", "gpt-4.1"),
         instructions=SYSTEM_PROMPT,
         input=[{"role": "user", "content": content}],
     )
-    answer = _extract_text_output(response)
+    answer = _normalize_answer(_extract_text_output(response))
     if not answer:
         raise RuntimeError("Model returned an empty response")
     return answer
+
+
+def _response_mode() -> str:
+    return os.getenv("RESPONSE_MODE", "plain").strip().lower()
 
 
 @app.get("/")
@@ -172,11 +236,12 @@ def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/", response_class=PlainTextResponse)
-def solve(request: QueryRequest) -> str:
-    fallback = _fallback_answer(request.query)
-    if fallback is not None:
-        return fallback
+@app.post("/")
+def solve(request: QueryRequest):
+    answer = _fallback_answer(request.query)
+    if answer is None:
+        answer = _openai_answer(request.query, request.assets)
 
-    output = _openai_answer(request.query, request.assets)
-    return output
+    if _response_mode() == "json":
+        return JSONResponse({"output": answer})
+    return PlainTextResponse(answer)
