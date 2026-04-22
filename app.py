@@ -7,7 +7,7 @@ import urllib.request
 from typing import Any
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 try:
@@ -227,10 +227,6 @@ def _openai_answer(query: str, assets: list[str]) -> str:
     return answer
 
 
-def _response_mode() -> str:
-    return os.getenv("RESPONSE_MODE", "plain").strip().lower()
-
-
 @app.get("/")
 def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
@@ -241,7 +237,4 @@ def solve(request: QueryRequest):
     answer = _fallback_answer(request.query)
     if answer is None:
         answer = _openai_answer(request.query, request.assets)
-
-    if _response_mode() == "json":
-        return JSONResponse({"output": answer})
-    return PlainTextResponse(answer)
+    return JSONResponse({"output": answer})
