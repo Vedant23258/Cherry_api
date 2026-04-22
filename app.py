@@ -3,6 +3,7 @@ import re
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 try:
@@ -59,10 +60,6 @@ If a question clearly asks for a sentence answer, return the sentence exactly an
 class QueryRequest(BaseModel):
     query: str
     assets: list[str] = Field(default_factory=list)
-
-
-class QueryResponse(BaseModel):
-    output: str
 
 
 app = FastAPI(title="Agon Eval API")
@@ -175,11 +172,11 @@ def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/", response_model=QueryResponse)
-def solve(request: QueryRequest) -> QueryResponse:
+@app.post("/", response_class=PlainTextResponse)
+def solve(request: QueryRequest) -> str:
     fallback = _fallback_answer(request.query)
     if fallback is not None:
-        return QueryResponse(output=fallback)
+        return fallback
 
     output = _openai_answer(request.query, request.assets)
-    return QueryResponse(output=output)
+    return output
